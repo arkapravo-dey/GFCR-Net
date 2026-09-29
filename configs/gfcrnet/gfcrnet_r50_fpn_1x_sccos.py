@@ -26,10 +26,7 @@ model = dict(
         type='GFCRNet',
         in_channels=[256, 512, 1024, 2048],
         out_channels=128, 
-        num_outs=5,
-        low_ratio=0.25,
-        high_ratio=0.60,
-        mspa_kernel_size=3),      
+        num_outs=5),      
     rpn_head=dict(
         type='OrientedRPNHead',
         in_channels=128,
@@ -211,6 +208,6 @@ lr_config = dict(
     warmup_ratio=0.3333333333333333,
     step=[8, 11])
 
-runner = dict(type='EpochBasedRunner', max_epochs=2) 
+runner = dict(type='EpochBasedRunner', max_epochs=36) 
 checkpoint_config = dict(interval=1)
 log_config = dict(interval=100, hooks=[dict(type='TextLoggerHook')])
