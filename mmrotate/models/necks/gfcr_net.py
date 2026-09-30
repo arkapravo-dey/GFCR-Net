@@ -357,7 +357,7 @@ class GFCRNet(FPN):
         # Standard FPN
         # ----------------------------------------------------
 
-        outs = super(FBRFPN, self).forward(
+        outs = super(GFCRNet, self).forward(
             refined_inputs
         )
 
