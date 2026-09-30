@@ -286,7 +286,7 @@ class GFCRNet(FPN):
         **kwargs
     ):
 
-        super(FBRFPN, self).__init__(
+        super(GFCRNet, self).__init__(
             in_channels=in_channels,
             out_channels=out_channels,
             num_outs=num_outs,
@@ -321,7 +321,7 @@ class GFCRNet(FPN):
     def forward(self, inputs):
 
         assert len(inputs) >= 4, (
-            "FBRFPN expects C2, C3, C4 and C5 "
+            "GFCRNet expects C2, C3, C4 and C5 "
             "from the ResNet backbone."
         )
 
