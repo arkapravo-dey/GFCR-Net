@@ -1,5 +1,5 @@
 custom_imports = dict(
-    imports=['mmrotate.models.necks.gfcr_net'],
+    imports=['mmrotate.models.backbones.gfcr_net'],
     allow_failed_imports=False
 )
 
