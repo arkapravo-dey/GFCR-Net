@@ -262,7 +262,7 @@ class FBR(nn.Module):
 # ============================================================
 
 @ROTATED_NECKS.register_module()
-class FBRFPN(FPN):
+class GFCRNet(FPN):
     """
     FBR applied ONLY to C2 and C3.
 
