@@ -1,364 +1,215 @@
-import torch
-import torch.nn as nn
 
-from mmcv.runner import auto_fp16
-from mmdet.models.necks import FPN
+custom_imports = dict(
+    imports=['mmrotate.models.necks.gfcr_net'], 
+    allow_failed_imports=False
+)
+_base_ = [
+    '../_base_/datasets/dotav1.py',
+    '../_base_/schedules/schedule_1x.py',
+    '../_base_/default_runtime.py'
+]
 
-from ..builder import ROTATED_NECKS
-
-
-# ============================================================
-# FBR: Frequency Band Refinement
-# ============================================================
-
-class FBR(nn.Module):
-    """
-    Frequency Band Refinement.
-
-    Splits the Fourier magnitude into:
-        - Low frequency
-        - Mid frequency
-        - High frequency
-
-    Each frequency band is independently gated.
-    The original Fourier phase is preserved.
-    """
-
-    def __init__(
-        self,
-        channels,
+angle_version = 'le135'
+model = dict(
+    type='OrientedRCNN',
+    backbone=dict(
+        type='ResNet',
+        depth=50,
+        num_stages=4,
+        out_indices=(0, 1, 2, 3),
+        frozen_stages=1,
+        norm_cfg=dict(type='BN', requires_grad=True),
+        norm_eval=True,
+        style='pytorch',
+        init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
+    neck=dict(
+        type='GFCRNet',
+        in_channels=[256, 512, 1024, 2048],
+        out_channels=128, 
+        num_outs=5,
         low_ratio=0.25,
-        high_ratio=0.60
-    ):
-        super(FBR, self).__init__()
-
-        if not (0.0 < low_ratio < high_ratio < 1.0):
-            raise ValueError(
-                "Require 0 < low_ratio < high_ratio < 1."
-            )
-
-        self.channels = channels
-        self.low_ratio = low_ratio
-        self.high_ratio = high_ratio
-
-        def make_gate():
-
-            return nn.Sequential(
-
-                nn.Conv2d(
-                    channels,
-                    channels,
-                    kernel_size=1,
-                    bias=True
-                ),
-
-                nn.LeakyReLU(
-                    negative_slope=0.1,
-                    inplace=True
-                ),
-
-                nn.Conv2d(
-                    channels,
-                    channels,
-                    kernel_size=1,
-                    bias=True
-                ),
-
-                nn.Sigmoid()
-            )
-
-        self.low_gate = make_gate()
-        self.mid_gate = make_gate()
-        self.high_gate = make_gate()
-
-    # --------------------------------------------------------
-    # Radial frequency masks
-    # --------------------------------------------------------
-
-    def _get_radial_masks(
-        self,
-        H,
-        W,
-        device,
-        dtype
-    ):
-
-        y = torch.arange(
-            H,
-            device=device,
-            dtype=dtype
-        ) - (H // 2)
-
-        x = torch.arange(
-            W,
-            device=device,
-            dtype=dtype
-        ) - (W // 2)
-
-        yy, xx = torch.meshgrid(
-            y,
-            x,
-            indexing="ij"
-        )
-
-        radius = torch.sqrt(
-            xx.pow(2) + yy.pow(2)
-        )
-
-        max_radius = radius.max().clamp_min(1.0)
-
-        normalized_radius = (
-            radius / max_radius
-        )
-
-        low_mask = (
-            normalized_radius <= self.low_ratio
-        )
-
-        mid_mask = (
-            (normalized_radius > self.low_ratio)
-            &
-            (normalized_radius <= self.high_ratio)
-        )
-
-        high_mask = (
-            normalized_radius > self.high_ratio
-        )
-
-        return (
-            low_mask.to(dtype=dtype),
-            mid_mask.to(dtype=dtype),
-            high_mask.to(dtype=dtype)
-        )
-
-    # --------------------------------------------------------
-    # Forward
-    # --------------------------------------------------------
-
-    def forward(self, x):
-
-        input_dtype = x.dtype
-
-        # FFT in FP32 for numerical stability
-        x_float = x.float()
-
-        B, C, H, W = x_float.shape
-
-        # ----------------------------------------------------
-        # Fourier transform
-        # ----------------------------------------------------
-
-        X = torch.fft.fft2(
-            x_float,
-            dim=(-2, -1),
-            norm="ortho"
-        )
-
-        # Shift zero frequency to center
-        X_shifted = torch.fft.fftshift(
-            X,
-            dim=(-2, -1)
-        )
-
-        # Magnitude and phase
-        magnitude = torch.abs(X_shifted)
-        phase = torch.angle(X_shifted)
-
-        # ----------------------------------------------------
-        # Frequency masks
-        # ----------------------------------------------------
-
-        (
-            low_mask,
-            mid_mask,
-            high_mask
-        ) = self._get_radial_masks(
-            H,
-            W,
-            x.device,
-            magnitude.dtype
-        )
-
-        low_mask = low_mask.view(
-            1, 1, H, W
-        )
-
-        mid_mask = mid_mask.view(
-            1, 1, H, W
-        )
-
-        high_mask = high_mask.view(
-            1, 1, H, W
-        )
-
-        # ----------------------------------------------------
-        # Split magnitude into frequency bands
-        # ----------------------------------------------------
-
-        M_low = magnitude * low_mask
-
-        M_mid = magnitude * mid_mask
-
-        M_high = magnitude * high_mask
-
-        # ----------------------------------------------------
-        # Learnable frequency gates
-        # ----------------------------------------------------
-
-        G_low = self.low_gate(M_low)
-
-        G_mid = self.mid_gate(M_mid)
-
-        G_high = self.high_gate(M_high)
-
-        # ----------------------------------------------------
-        # Refine frequency bands
-        # ----------------------------------------------------
-
-        M_low_ref = M_low * G_low
-
-        M_mid_ref = M_mid * G_mid
-
-        M_high_ref = M_high * G_high
-
-        magnitude_refined = (
-            M_low_ref
-            + M_mid_ref
-            + M_high_ref
-        )
-
-        # ----------------------------------------------------
-        # Reconstruct using ORIGINAL phase
-        # ----------------------------------------------------
-
-        X_refined_shifted = torch.polar(
-            magnitude_refined,
-            phase
-        )
-
-        # Reverse FFT shift
-        X_refined = torch.fft.ifftshift(
-            X_refined_shifted,
-            dim=(-2, -1)
-        )
-
-        # ----------------------------------------------------
-        # Inverse FFT
-        # ----------------------------------------------------
-
-        out = torch.fft.ifft2(
-            X_refined,
-            dim=(-2, -1),
-            norm="ortho"
-        )
-
-        return out.real.to(
-            dtype=input_dtype
-        )
-
-
-# ============================================================
-# FBR-FPN
-# ============================================================
-
-@ROTATED_NECKS.register_module()
-class GFCRNet(FPN):
-    """
-    FBR applied ONLY to C2 and C3.
-
-    Architecture:
-
-        C2 ── FBR ──┐
-        C3 ── FBR ──┤
-        C4 ─────────┤── FPN
-        C5 ─────────┘
-
-    The FPN itself remains standard.
-    """
-
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        num_outs,
-        low_ratio=0.25,
-        high_ratio=0.60,
-        **kwargs
-    ):
-
-        super(GFCRNet, self).__init__(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            num_outs=num_outs,
-            **kwargs
-        )
-
-        # ----------------------------------------------------
-        # FBR only for C2 and C3
-        #
-        # ResNet-50:
-        # C2 = 256 channels
-        # C3 = 512 channels
-        # ----------------------------------------------------
-
-        self.fbr_c2 = FBR(
-            channels=in_channels[0],
-            low_ratio=low_ratio,
-            high_ratio=high_ratio
-        )
-
-        self.fbr_c3 = FBR(
-            channels=in_channels[1],
-            low_ratio=low_ratio,
-            high_ratio=high_ratio
-        )
-
-    # --------------------------------------------------------
-    # Forward
-    # --------------------------------------------------------
-
-    @auto_fp16()
-    def forward(self, inputs):
-
-        assert len(inputs) >= 4, (
-            "GFCRNet expects C2, C3, C4 and C5 "
-            "from the ResNet backbone."
-        )
-
-        # ----------------------------------------------------
-        # ResNet features
-        # ----------------------------------------------------
-
-        C2 = inputs[0]
-        C3 = inputs[1]
-        C4 = inputs[2]
-        C5 = inputs[3]
-
-        # ----------------------------------------------------
-        # FBR ONLY on high-resolution features
-        # ----------------------------------------------------
-
-        C2 = self.fbr_c2(C2)
-
-        C3 = self.fbr_c3(C3)
-
-        # ----------------------------------------------------
-        # C4 and C5 remain untouched
-        # ----------------------------------------------------
-
-        refined_inputs = (
-            C2,
-            C3,
-            C4,
-            C5
-        )
-
-        # ----------------------------------------------------
-        # Standard FPN
-        # ----------------------------------------------------
-
-        outs = super(GFCRNet, self).forward(
-            refined_inputs
-        )
-
-        return outs
+        high_ratio=0.60),      
+    rpn_head=dict(
+        type='OrientedRPNHead',
+        in_channels=128,
+        feat_channels=128,
+        version='le135',
+        anchor_generator=dict(
+            type='AnchorGenerator',
+            scales=[8],
+            ratios=[0.5, 1.0, 2.0],
+            strides=[4, 8, 16, 32, 64]),
+        bbox_coder=dict(
+            type='MidpointOffsetCoder',
+            angle_range='le135',
+            target_means=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            target_stds=[1.0, 1.0, 1.0, 1.0, 0.5, 0.5]),
+        loss_cls=dict(
+            type='CrossEntropyLoss', use_sigmoid=True, loss_weight=1.0),
+        loss_bbox=dict(
+            type='SmoothL1Loss', beta=0.1111111111111111, loss_weight=1.0)),
+    roi_head=dict(
+        type='OrientedStandardRoIHead',
+        bbox_roi_extractor=dict(
+            type='RotatedSingleRoIExtractor',
+            roi_layer=dict(
+                type='RoIAlignRotated',
+                out_size=7,
+                sample_num=2,
+                clockwise=True),
+            out_channels=128,
+            featmap_strides=[4, 8, 16, 32]),
+        bbox_head=dict(
+            type='RotatedShared2FCBBoxHead',
+            in_channels=128,
+            fc_out_channels=1024,
+            roi_feat_size=7,
+            num_classes=1,
+            bbox_coder=dict(
+                type='DeltaXYWHAOBBoxCoder',
+                angle_range='le135',
+                norm_factor=None,
+                edge_swap=True,
+                proj_xy=True,
+                target_means=(0.0, 0.0, 0.0, 0.0, 0.0),
+                target_stds=(0.1, 0.1, 0.2, 0.2, 0.1)),
+            reg_class_agnostic=True,
+            loss_cls=dict(
+                type='CrossEntropyLoss', use_sigmoid=False, loss_weight=1.0),
+            loss_bbox=dict(type='SmoothL1Loss', beta=1.0, loss_weight=1.0))),
+    train_cfg=dict(
+        rpn=dict(
+            assigner=dict(
+                type='MaxIoUAssigner',
+                pos_iou_thr=0.7,
+                neg_iou_thr=0.3,
+                min_pos_iou=0.3,
+                match_low_quality=True,
+                ignore_iof_thr=-1),
+            sampler=dict(
+                type='RandomSampler',
+                num=128,
+                pos_fraction=0.5,
+                neg_pos_ub=-1,
+                add_gt_as_proposals=False),
+            allowed_border=0,
+            pos_weight=-1,
+            debug=False),
+        rpn_proposal=dict(
+            nms_pre=2000,
+            max_per_img=2000,
+            nms=dict(type='nms', iou_threshold=0.8),
+            min_bbox_size=0),
+        rcnn=dict(
+            assigner=dict(
+                type='MaxIoUAssigner',
+                pos_iou_thr=0.5,
+                neg_iou_thr=0.5,
+                min_pos_iou=0.5,
+                match_low_quality=False,
+                iou_calculator=dict(type='RBboxOverlaps2D'),
+                ignore_iof_thr=-1),
+            sampler=dict(
+                type='RRandomSampler',
+                num=512,
+                pos_fraction=0.25,
+                neg_pos_ub=-1,
+                add_gt_as_proposals=True),
+            pos_weight=-1,
+            debug=False)),
+    test_cfg=dict(
+        rpn=dict(
+            nms_pre=2000,
+            max_per_img=2000,
+            nms=dict(type='nms', iou_threshold=0.8),
+            min_bbox_size=0),
+        rcnn=dict(
+            nms_pre=2000,
+            min_bbox_size=0,
+            score_thr=0.05,
+            nms=dict(iou_thr=0.1),
+            max_per_img=2000)))
+
+# Dataset settings
+dataset_type = 'DOTADataset'
+data_root = '/kaggle/input/sccos-data/sccos_dota/'
+classes = ('ship',)
+img_norm_cfg = dict(
+    mean=[123.675, 116.28, 103.53],
+    std=[58.395, 57.12, 57.375],
+    to_rgb=True)
+
+train_pipeline = [
+    dict(type='LoadImageFromFile'),
+    dict(type='LoadAnnotations', with_bbox=True),
+    dict(type='RResize', img_scale=(1024, 1024)),
+    dict(
+        type='RRandomFlip',
+        flip_ratio=[0.25, 0.25, 0.25],
+        direction=['horizontal', 'vertical', 'diagonal'],
+        version='le135'),
+    dict(type='PhotoMetricDistortion'),
+    dict(type='Normalize', **img_norm_cfg),
+    dict(type='Pad', size_divisor=32),
+    dict(type='DefaultFormatBundle'),
+    dict(type='Collect', keys=['img', 'gt_bboxes', 'gt_labels'])
+]
+
+test_pipeline = [
+    dict(type='LoadImageFromFile'),
+    dict(
+        type='MultiScaleFlipAug',
+        img_scale=(1024, 1024),
+        flip=False,
+        transforms=[
+            dict(type='RResize'),
+            dict(type='Normalize', **img_norm_cfg),
+            dict(type='Pad', size_divisor=32),
+            dict(type='DefaultFormatBundle'),
+            dict(type='Collect', keys=['img'])
+        ])
+]
+
+data = dict(
+    samples_per_gpu=4,
+    workers_per_gpu=4,
+    train=dict(
+        type=dataset_type,
+        ann_file=data_root + 'train/labels/',
+        img_prefix=data_root + 'train/images/',
+        pipeline=train_pipeline,
+        version='le135',
+        classes=('ship',)),
+    val=dict(
+        type=dataset_type,
+        ann_file=data_root + 'val/labels/',
+        img_prefix=data_root + 'val/images/',
+        pipeline=test_pipeline,
+        version='le135',
+        classes=('ship',)),
+    test=dict(
+        type=dataset_type,
+        ann_file=data_root + 'test/labels/',
+        img_prefix=data_root + 'test/images/',
+        pipeline=test_pipeline,
+        version='le135',
+        classes=('ship',)))
+
+# EVALUATION SETUP: Removed 'classwise=True' to fix the TypeError
+evaluation = dict(
+    interval=1, 
+    metric='mAP', 
+    iou_thr=0.5, 
+    save_best='mAP' 
+)
+
+lr_config = dict(
+    policy='step',
+    warmup='linear',
+    warmup_iters=1000,
+    warmup_ratio=0.3333333333333333,
+    step=[8, 11])
+
+runner = dict(type='EpochBasedRunner', max_epochs=2) 
+checkpoint_config = dict(interval=1)
+log_config = dict(interval=100, hooks=[dict(type='TextLoggerHook')])
